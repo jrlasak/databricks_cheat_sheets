@@ -1,72 +1,20 @@
--- 🏛️ Unity Catalog Admin & Security Snippets (SQL)
--- Use with a UC-enabled workspace. Replace placeholders before running.
+-- 🏛️ Unity Catalog Administration: Complete Security & Governance Guide
+-- Production-ready patterns for data governance, security, and access control
 
--- 1) Create catalog and schema ----------------------------------------------
-CREATE CATALOG IF NOT EXISTS my_catalog COMMENT 'Product analytics';
-ALTER CATALOG my_catalog OWNER TO `account users`;
-GRANT USE CATALOG ON CATALOG my_catalog TO `account users`;
+-- =============================================================================
+-- 1. Catalog & Schema Management
+-- =============================================================================
 
-CREATE SCHEMA IF NOT EXISTS my_catalog.raw COMMENT 'Raw/bronze';
-CREATE SCHEMA IF NOT EXISTS my_catalog.analytics COMMENT 'Silver/Gold';
-GRANT USAGE ON SCHEMA my_catalog.analytics TO `account users`;
-GRANT CREATE, SELECT ON SCHEMA my_catalog.analytics TO `data_science`;
-
--- 2) External locations (requires a storage credential) ----------------------
--- CREATE STORAGE CREDENTIAL my_cred TYPE KEYTAB|AZURE_MANAGED_IDENTITY|... OPTIONS (...);
--- Replace with an existing credential name you have rights to use.
-CREATE EXTERNAL LOCATION IF NOT EXISTS my_ext_loc
-URL 's3://your-bucket/analytics/'
-WITH (STORAGE CREDENTIAL my_cred)
-COMMENT 'External UC location for analytics data';
-
--- Create an external table bound to the location
--- CREATE TABLE my_catalog.analytics.events
--- USING DELTA LOCATION 's3://your-bucket/analytics/events';
-
--- 3) Volumes for files (managed by UC) --------------------------------------
-CREATE VOLUME IF NOT EXISTS my_catalog.analytics.files COMMENT 'Non-tabular data';
--- Put/list files via dbfs:/Volumes/my_catalog/analytics/files
-
--- 4) Row/column security via secure views -----------------------------------
-CREATE OR REPLACE VIEW my_catalog.analytics.events_secured AS
-SELECT
-  CASE WHEN is_member('pii_readers') THEN email ELSE NULL END AS email_masked,
-  * EXCEPT(email)
-FROM my_catalog.analytics.events;
-GRANT SELECT ON VIEW my_catalog.analytics.events_secured TO `analysts`;
-
--- Row filter example using group membership
-CREATE OR REPLACE VIEW my_catalog.analytics.events_row_filter AS
-SELECT *
-FROM my_catalog.analytics.events
-WHERE country IN (
-  CASE WHEN is_member('EMEA_group') THEN ('DE','FR','GB','ES','IT') ELSE ('US') END
-);
-
--- 5) Auditing helpers --------------------------------------------------------
--- Query access logs (requires account-level audit logs configured)
--- SELECT * FROM system.access.audit WHERE action_name = 'select' AND date >= current_date() - 7;
-
--- 6) Delta Sharing (simplified) ---------------------------------------------
--- CREATE SHARE ext_share COMMENT 'External consumers';
--- ALTER SHARE ext_share ADD TABLE my_catalog.analytics.events_secured;
--- CREATE RECIPIENT acme_recipient USING TOKEN;  -- exchanged out-of-band
--- GRANT SELECT ON SHARE ext_share TO RECIPIENT acme_recipient;
-
-
--- ============================================================================
--- Databricks Security & Access Control: Unity Catalog Guide
--- Production-ready security patterns for data governance.
--- ============================================================================
-
--- --- 1. Unity Catalog Hierarchy Setup ---
--- Organize your data with proper governance structure.
-
--- Create catalog (equivalent to database in traditional systems)
+-- Create catalog hierarchy for data governance
 CREATE CATALOG IF NOT EXISTS production_data
 COMMENT 'Production data catalog for business analytics';
 
--- Create schemas within catalog (logical groupings)
+-- Set catalog ownership and permissions
+ALTER CATALOG production_data OWNER TO `data-admin-group`;
+GRANT USE CATALOG ON CATALOG production_data TO `all-users`;
+GRANT CREATE SCHEMA ON CATALOG production_data TO `data-engineers`;
+
+-- Create schemas following medallion architecture
 CREATE SCHEMA IF NOT EXISTS production_data.raw
 COMMENT 'Raw ingested data from source systems';
 
@@ -79,243 +27,329 @@ COMMENT 'Business-logic applied, conformed data';
 CREATE SCHEMA IF NOT EXISTS production_data.gold
 COMMENT 'Aggregated data ready for analytics and reporting';
 
--- --- 2. Table Access Control Patterns ---
+-- Schema-level permissions
+GRANT USAGE ON SCHEMA production_data.raw TO `data-engineers`;
+GRANT CREATE TABLE, MODIFY ON SCHEMA production_data.raw TO `data-engineers`;
 
--- Grant catalog permissions (admin level)
-GRANT USE CATALOG ON CATALOG production_data TO `data-engineers@company.com`;
-GRANT CREATE SCHEMA ON CATALOG production_data TO `data-engineers@company.com`;
+GRANT USAGE ON SCHEMA production_data.gold TO `analysts`;
+GRANT SELECT ON SCHEMA production_data.gold TO `analysts`;
+GRANT SELECT ON SCHEMA production_data.gold TO `business-users`;
 
--- Grant schema permissions 
-GRANT USE SCHEMA ON SCHEMA production_data.raw TO `data-engineers@company.com`;
-GRANT CREATE TABLE ON SCHEMA production_data.raw TO `data-engineers@company.com`;
+-- =============================================================================
+-- 2. External Storage Configuration
+-- =============================================================================
 
--- Read-only access for analysts
-GRANT USE CATALOG ON CATALOG production_data TO `analysts@company.com`;
-GRANT USE SCHEMA ON SCHEMA production_data.gold TO `analysts@company.com`; 
-GRANT SELECT ON SCHEMA production_data.gold TO `analysts@company.com`;
+-- Create storage credential (adjust for your cloud provider)
+-- For AWS:
+-- CREATE STORAGE CREDENTIAL aws_s3_credential
+-- USING AWS (
+--   aws_iam_role = 'arn:aws:iam::123456789012:role/databricks-unity-catalog-role'
+-- ) COMMENT 'S3 access for Unity Catalog';
 
--- Table-level permissions for sensitive data
-GRANT SELECT ON TABLE production_data.gold.customer_metrics TO `marketing-team@company.com`;
-GRANT SELECT ON TABLE production_data.gold.financial_summary TO `finance-team@company.com`;
+-- For Azure:
+-- CREATE STORAGE CREDENTIAL azure_storage_credential
+-- USING AZURE_MANAGED_IDENTITY (
+--   managed_identity_id = '/subscriptions/sub-id/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/mi-name'
+-- ) COMMENT 'Azure Storage access for Unity Catalog';
 
--- --- 3. Row-Level Security (RLS) ---
--- Control access to specific rows based on user attributes.
+-- Create external location
+CREATE EXTERNAL LOCATION IF NOT EXISTS production_raw_data
+URL 's3://your-production-bucket/raw-data/'
+WITH (STORAGE CREDENTIAL aws_s3_credential)
+COMMENT 'External location for raw data ingestion';
 
--- Enable row-level security on a table
-ALTER TABLE production_data.gold.sales_data 
-SET ROW FILTER finance_filter ON (department);
+-- Grant permissions on external location
+GRANT CREATE EXTERNAL TABLE ON EXTERNAL LOCATION production_raw_data TO `data-engineers`;
+GRANT READ FILES ON EXTERNAL LOCATION production_raw_data TO `data-engineers`;
+GRANT WRITE FILES ON EXTERNAL LOCATION production_raw_data TO `etl-service-principal`;
 
--- Create row filter function
-CREATE OR REPLACE FUNCTION finance_filter(department STRING)
+-- Create external table using the location
+CREATE TABLE IF NOT EXISTS production_data.raw.customer_events
+USING DELTA
+LOCATION 's3://your-production-bucket/raw-data/customer-events/'
+COMMENT 'Raw customer events from external systems';
+
+-- =============================================================================
+-- 3. Volumes for File Management
+-- =============================================================================
+
+-- Create volumes for non-tabular data
+CREATE VOLUME IF NOT EXISTS production_data.raw.landing_files
+COMMENT 'Landing zone for incoming files';
+
+CREATE VOLUME IF NOT EXISTS production_data.gold.reports
+COMMENT 'Generated reports and exports';
+
+-- Grant volume permissions
+GRANT READ VOLUME ON VOLUME production_data.raw.landing_files TO `data-engineers`;
+GRANT WRITE VOLUME ON VOLUME production_data.raw.landing_files TO `ingestion-service`;
+
+-- Access volumes programmatically:
+-- Python: dbutils.fs.ls('/Volumes/production_data/raw/landing_files/')
+-- Path format: /Volumes/{catalog}/{schema}/{volume}/
+
+-- =============================================================================
+-- 4. Row-Level Security (RLS) Patterns
+-- =============================================================================
+
+-- Create row filter function for regional data access
+CREATE OR REPLACE FUNCTION production_data.silver.regional_access_filter(region STRING)
 RETURNS BOOLEAN
 RETURN 
   CASE 
-    WHEN is_member('finance-team@company.com') THEN TRUE
-    WHEN is_member('sales-team@company.com') AND department = 'Sales' THEN TRUE
-    WHEN is_member('marketing-team@company.com') AND department IN ('Sales', 'Marketing') THEN TRUE
+    WHEN is_member('global-access') THEN TRUE
+    WHEN is_member('us-region-access') AND region = 'US' THEN TRUE
+    WHEN is_member('eu-region-access') AND region IN ('EU', 'EMEA') THEN TRUE
+    WHEN is_member('apac-region-access') AND region = 'APAC' THEN TRUE
     ELSE FALSE
   END;
 
--- --- 4. Column-Level Security & Dynamic Masking ---
--- Protect sensitive data with column masking.
+-- Apply row filter to table
+ALTER TABLE production_data.silver.customer_data 
+SET ROW FILTER production_data.silver.regional_access_filter ON (region);
 
--- Apply column mask for PII data
-ALTER TABLE production_data.silver.customers
-ALTER COLUMN email SET MASK email_mask;
+-- Time-based row filter (only show recent data to certain users)
+CREATE OR REPLACE FUNCTION production_data.silver.time_based_filter(event_date DATE)
+RETURNS BOOLEAN
+RETURN 
+  CASE 
+    WHEN is_member('full-history-access') THEN TRUE
+    WHEN is_member('recent-data-access') AND event_date >= current_date() - INTERVAL 90 DAYS THEN TRUE
+    ELSE FALSE
+  END;
 
--- Create masking function
-CREATE OR REPLACE FUNCTION email_mask(email_value STRING)
+-- =============================================================================
+-- 5. Column-Level Security & Dynamic Data Masking
+-- =============================================================================
+
+-- Email masking function
+CREATE OR REPLACE FUNCTION production_data.silver.email_mask(email_value STRING)
 RETURNS STRING
 RETURN 
   CASE
-    WHEN is_member('customer-service@company.com') THEN email_value  -- Full access
-    WHEN is_member('analysts@company.com') THEN 
-      concat('***@', split(email_value, '@')[1])  -- Domain only
-    ELSE '***@***.com'  -- Fully masked
+    WHEN is_member('pii-access') THEN email_value
+    WHEN is_member('partial-pii-access') THEN 
+      concat(left(split(email_value, '@')[0], 2), '***@', split(email_value, '@')[1])
+    ELSE '***@***.com'
   END;
 
--- Mask sensitive financial data
-CREATE OR REPLACE FUNCTION salary_mask(salary_value DECIMAL(10,2))
+-- Apply column mask
+ALTER TABLE production_data.silver.customers
+ALTER COLUMN email SET MASK production_data.silver.email_mask;
+
+-- Financial data masking
+CREATE OR REPLACE FUNCTION production_data.silver.salary_mask(salary_value DECIMAL(10,2))
 RETURNS DECIMAL(10,2) 
 RETURN 
   CASE
-    WHEN is_member('hr-team@company.com') THEN salary_value
-    WHEN is_member('managers@company.com') THEN 
+    WHEN is_member('finance-access') THEN salary_value
+    WHEN is_member('hr-access') AND salary_value <= 150000 THEN salary_value
+    WHEN is_member('manager-access') THEN 
       CASE WHEN salary_value > 100000 THEN 100000.00 ELSE salary_value END
     ELSE NULL
   END;
 
--- --- 5. Service Principal Management ---
--- Secure authentication for automated jobs and applications.
+ALTER TABLE production_data.silver.employee_data
+ALTER COLUMN salary SET MASK production_data.silver.salary_mask;
 
--- Create service principal for ETL jobs (via REST API or Databricks CLI)
--- databricks service-principals create --display-name "etl-service-principal"
+-- =============================================================================
+-- 6. Service Principal Management
+-- =============================================================================
 
--- Grant permissions to service principal
-GRANT USE CATALOG ON CATALOG production_data TO `12345678-abcd-efgh-ijkl-123456789012`;
-GRANT USE SCHEMA ON SCHEMA production_data.bronze TO `12345678-abcd-efgh-ijkl-123456789012`;
-GRANT SELECT, MODIFY ON SCHEMA production_data.bronze TO `12345678-abcd-efgh-ijkl-123456789012`;
+-- Service principals are created via REST API or Databricks CLI
+-- databricks service-principals create --display-name "etl-pipeline-sp"
 
--- Python: Configure service principal authentication in job (commented for SQL file safety)
--- import os
--- from databricks import sql
--- 
--- # Service principal credentials (store in Databricks secrets)
--- client_id = dbutils.secrets.get("service-principals", "etl-client-id")
--- client_secret = dbutils.secrets.get("service-principals", "etl-client-secret")
--- 
--- connection = sql.connect(
---     server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME"),
---     http_path=os.getenv("DATABRICKS_HTTP_PATH"),
---     client_id=client_id,
---     client_secret=client_secret
--- )
+-- Grant permissions to service principal (use the SP's application ID)
+GRANT USE CATALOG ON CATALOG production_data 
+TO `12345678-abcd-1234-5678-123456789012`;
 
--- --- 6. Data Lineage and Auditing ---
--- Track data access and modifications for compliance.
+GRANT USE SCHEMA ON SCHEMA production_data.bronze 
+TO `12345678-abcd-1234-5678-123456789012`;
 
--- Query lineage information
+GRANT SELECT, MODIFY ON SCHEMA production_data.bronze 
+TO `12345678-abcd-1234-5678-123456789012`;
+
+-- Create service principal groups for easier management
+-- In Databricks Admin Console: Create group "etl-service-principals"
+-- Add service principals to this group, then grant permissions to the group
+
+-- =============================================================================
+-- 7. Data Lineage and Auditing
+-- =============================================================================
+
+-- Query table metadata and lineage
 SELECT 
   table_catalog,
-  table_schema, 
+  table_schema,
+  table_name,
+  table_type,
+  created,
+  comment
+FROM information_schema.tables 
+WHERE table_catalog = 'production_data'
+  AND table_schema = 'silver'
+ORDER BY created DESC;
+
+-- Column-level metadata
+SELECT 
+  table_catalog,
+  table_schema,
   table_name,
   column_name,
   data_type,
-  is_nullable
+  is_nullable,
+  column_default
 FROM information_schema.columns 
 WHERE table_catalog = 'production_data'
-  AND table_schema = 'gold'
-ORDER BY table_name, column_name;
+  AND table_schema = 'silver'
+ORDER BY table_name, ordinal_position;
 
--- Audit table access history
+-- Query audit logs (requires system tables access)
 SELECT 
   event_time,
   user_identity.email as user_email,
   action_name,
-  request_params.full_name_arg as table_name,
+  request_params.full_name_arg as object_name,
   source_ip_address
 FROM system.access.audit
-WHERE action_name IN ('getTable', 'createTable', 'deleteTable')
+WHERE action_name IN ('getTable', 'createTable', 'deleteTable', 'select')
   AND event_time >= current_timestamp() - INTERVAL 7 DAYS
   AND request_params.full_name_arg LIKE 'production_data%'
 ORDER BY event_time DESC
 LIMIT 100;
 
--- --- 7. External Location Security ---
--- Secure access to cloud storage (S3, ADLS, GCS).
+-- =============================================================================
+-- 8. Data Classification & Tagging
+-- =============================================================================
 
--- Create external location with secure access
-CREATE EXTERNAL LOCATION IF NOT EXISTS s3_production_bucket
-URL 's3://production-data-bucket/path/'
-WITH (STORAGE CREDENTIAL production_s3_credential)
-COMMENT 'Production S3 bucket for raw data ingestion';
-
--- Grant access to external location
-GRANT READ FILES ON EXTERNAL LOCATION s3_production_bucket TO `data-engineers@company.com`;
-GRANT WRITE FILES ON EXTERNAL LOCATION s3_production_bucket TO `etl-service-principal`;
-
--- --- 8. Secret Management ---
--- Secure storage and access of sensitive configuration.
-
--- Python: Access secrets in notebooks/jobs (commented for SQL file safety)
--- def get_database_connection():
---     """Secure database connection using Databricks secrets"""
---     return {
---         "host": dbutils.secrets.get("database-creds", "host"),
---         "username": dbutils.secrets.get("database-creds", "username"), 
---         "password": dbutils.secrets.get("database-creds", "password"),
---         "database": dbutils.secrets.get("database-creds", "database")
---     }
-
--- Databricks CLI: Manage secrets (run from terminal)
--- databricks secrets create-scope --scope database-creds
--- databricks secrets put --scope database-creds --key host
--- databricks secrets put --scope database-creds --key username  
--- databricks secrets put --scope database-creds --key password
-
--- --- 9. Compliance and Data Classification ---
--- Tag sensitive data for compliance reporting.
-
--- Tag tables with sensitivity levels
+-- Tag tables with sensitivity and compliance classifications
 ALTER TABLE production_data.silver.customers 
-SET TAGS ('data_classification' = 'PII', 'retention_policy' = '7_years');
+SET TAGS ('data_classification' = 'PII', 'retention_policy' = '7_years', 'compliance' = 'GDPR');
 
 ALTER TABLE production_data.gold.financial_reports
-SET TAGS ('data_classification' = 'CONFIDENTIAL', 'compliance' = 'SOX');
+SET TAGS ('data_classification' = 'CONFIDENTIAL', 'compliance' = 'SOX', 'department' = 'finance');
 
--- Query tables by classification
+-- Query tables by classification tags
 SELECT 
-  table_catalog,
-  table_schema,
-  table_name,
-  comment
+  t.table_catalog,
+  t.table_schema,
+  t.table_name,
+  tt.tag_name,
+  tt.tag_value
 FROM information_schema.tables t
 JOIN information_schema.table_tags tt ON 
   t.table_catalog = tt.catalog_name AND
   t.table_schema = tt.schema_name AND  
   t.table_name = tt.table_name
 WHERE tt.tag_name = 'data_classification'
-  AND tt.tag_value = 'PII';
+  AND tt.tag_value IN ('PII', 'CONFIDENTIAL')
+ORDER BY t.table_name;
 
--- --- 10. Security Best Practices Checklist ---
+-- =============================================================================
+-- 9. Delta Sharing (Data Sharing with External Organizations)
+-- =============================================================================
 
--- ✅ Catalog Organization:
--- - Separate catalogs for dev/staging/prod environments
--- - Clear schema naming conventions (raw/bronze/silver/gold)
--- - Proper catalog and schema ownership
+-- Create a share for external data consumers
+CREATE SHARE IF NOT EXISTS customer_analytics_share
+COMMENT 'Customer analytics data for external partners';
 
--- ✅ Access Control:  
--- - Principle of least privilege
--- - Use groups instead of individual users
--- - Regular access reviews and cleanup
--- - Service principals for automation
+-- Add tables to the share
+ALTER SHARE customer_analytics_share 
+ADD TABLE production_data.gold.customer_metrics
+COMMENT 'Aggregated customer metrics - no PII';
 
--- ✅ Data Protection:
--- - Row-level security for multi-tenant data
--- - Column masking for PII/sensitive data  
--- - External location security for cloud storage
--- - Secret management for credentials
+-- Create recipient (done via API/CLI, shown for reference)
+-- databricks recipients create customer-partner-recipient --authentication-type token
 
--- ✅ Monitoring & Compliance:
--- - Enable audit logging
--- - Monitor unusual access patterns
--- - Data classification tags
--- - Regular security assessments
+-- Grant share access to recipient
+-- GRANT SELECT ON SHARE customer_analytics_share TO RECIPIENT `customer-partner-recipient`;
 
--- ✅ Development Practices:
--- - Code reviews for security changes
--- - Automated security testing
--- - Secure CI/CD pipelines
--- - Documentation of security controls
+-- Monitor share usage
+-- SELECT * FROM system.information_schema.share_usage_stats
+-- WHERE share_name = 'customer_analytics_share';
 
--- Security monitoring query template
-WITH security_events AS (
+-- =============================================================================
+-- 10. Security Monitoring Queries
+-- =============================================================================
+
+-- High-activity users (potential security concern)
+WITH user_activity AS (
   SELECT 
-    event_time,
-    user_identity.email,
-    action_name,
-    request_params.full_name_arg as resource,
-    response.status_code,
-    source_ip_address
+    user_identity.email as user_email,
+    count(*) as action_count,
+    count(distinct request_params.full_name_arg) as unique_objects
   FROM system.access.audit
   WHERE event_time >= current_timestamp() - INTERVAL 24 HOURS
-    AND action_name IN ('getTable', 'createTable', 'deleteTable', 'alterTable')
+    AND action_name IN ('select', 'createTable', 'deleteTable', 'alterTable')
+  GROUP BY user_identity.email
 )
 SELECT 
-  email,
-  COUNT(*) as action_count,
-  COUNT(DISTINCT resource) as unique_resources,
-  MAX(event_time) as last_activity
-FROM security_events  
-GROUP BY email
-HAVING action_count > 50  -- Flag high activity users
+  user_email,
+  action_count,
+  unique_objects
+FROM user_activity
+WHERE action_count > 100  -- Threshold for investigation
 ORDER BY action_count DESC;
+
+-- Failed access attempts
+SELECT 
+  event_time,
+  user_identity.email,
+  action_name,
+  request_params.full_name_arg as attempted_resource,
+  response.status_code,
+  response.error_message
+FROM system.access.audit
+WHERE response.status_code != 200
+  AND event_time >= current_timestamp() - INTERVAL 7 DAYS
+ORDER BY event_time DESC;
+
+-- Data access outside business hours
+SELECT 
+  event_time,
+  user_identity.email,
+  action_name,
+  request_params.full_name_arg as resource_accessed
+FROM system.access.audit
+WHERE action_name = 'select'
+  AND (hour(event_time) < 8 OR hour(event_time) > 18)  -- Outside 8 AM - 6 PM
+  AND dayofweek(event_time) IN (2,3,4,5,6)  -- Weekdays only
+  AND event_time >= current_timestamp() - INTERVAL 7 DAYS
+ORDER BY event_time DESC;
+
+-- =============================================================================
+-- 11. Best Practices Checklist
+-- =============================================================================
+
+-- ✅ Governance Structure:
+-- • Use consistent naming conventions (catalog.schema.table)
+-- • Implement medallion architecture (raw/bronze/silver/gold)
+-- • Document table purposes with meaningful comments
+-- • Use appropriate data types and constraints
+
+-- ✅ Access Control:
+-- • Follow principle of least privilege
+-- • Use groups instead of individual user grants
+-- • Implement row-level and column-level security where needed
+-- • Regular access reviews and cleanup
+
+-- ✅ Security:
+-- • Enable audit logging at account level
+-- • Monitor for unusual access patterns
+-- • Use service principals for automated processes
+-- • Classify and tag sensitive data
+
+-- ✅ Compliance:
+-- • Document data lineage and transformations
+-- • Implement retention policies
+-- • Use appropriate masking for PII
+-- • Regular security assessments
 
 -- Pro Tips:
 -- 1. Start with Unity Catalog - it's the foundation of Databricks security
--- 2. Use groups for access management, not individual users
--- 3. Implement data classification early in your data architecture  
--- 4. Monitor audit logs regularly for unusual patterns
--- 5. Test security controls in non-production environments first
+-- 2. Use infrastructure as code (Terraform) for reproducible UC setup
+-- 3. Test access controls in development before applying to production
+-- 4. Monitor audit logs regularly for compliance and security
+-- 5. Train teams on UC concepts and security best practices
 
--- Complete Unity Catalog guide at jakublasak.com
+
