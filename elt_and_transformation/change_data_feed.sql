@@ -35,5 +35,3 @@ WHEN MATCHED THEN UPDATE SET processed_version = src.processed_version
 WHEN NOT MATCHED THEN INSERT (table_name, processed_version) VALUES (src.table_name, src.processed_version);
 
 -- Pro Tip: Run this in a scheduled job for incremental ETL. 
--- See post for full CDF guide!
--- linkedin.com/in/jrlasak/
